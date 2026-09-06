@@ -9,6 +9,17 @@ Windows / macOS equivalents). No dev headers are required at build
 time either — `cargo build` works on any platform regardless of which
 audio SDK is installed.
 
+## FreeBSD OSS
+
+FreeBSD uses the kernel OSS API directly. The backend opens `/dev/dsp` (or a
+caller-selected `/dev/dspN`), negotiates signed 16-bit little-endian PCM with
+`SNDCTL_DSP_SETFMT`, then sets channels and sample rate through the native
+FreeBSD ioctl encoding before running the ordinary worker/callback loop. The
+implementation does not reuse Linux ioctl numbers or request packing.
+
+Like the other backends, the libc entry points are resolved at runtime, so
+adding FreeBSD OSS support does not add a link-time audio dependency.
+
 ## Backends
 
 | Target  | Backend   | Status      | Shared object                                                                 |
@@ -17,6 +28,7 @@ audio SDK is installed.
 | Linux   | PulseAudio| Functional  | `libpulse-simple.so.0`                                                        |
 | Linux   | ALSA      | Functional  | `libasound.so.2`                                                              |
 | Linux   | OSS       | Functional  | `/dev/dsp` via dlopen'd libc (`open`/`close`/`write`/`ioctl`)                 |
+| FreeBSD | OSS       | **Functional** | native OSS `/dev/dsp*` ABI via dlopen'd libc; S16_LE negotiation              |
 | Windows | WASAPI    | Functional  | `ole32.dll` + `kernel32.dll` (COM vtables invoked by hand, shared-mode)       |
 | Windows | ASIO      | Stub        | Vendor-supplied DLLs under `HKLM\SOFTWARE\ASIO` (not yet wired)               |
 | macOS   | CoreAudio | Functional  | `AudioToolbox.framework` (AudioQueue API)                                     |
@@ -26,14 +38,15 @@ audio SDK is installed.
 whose dummy-open succeeds, in the documented preference order:
 
 - Linux: PipeWire → PulseAudio → ALSA → OSS
+- FreeBSD: OSS
 - Windows: WASAPI → ASIO
 - macOS: CoreAudio
 
 Stubbed backends fail `probe()` cleanly so auto-selection falls through
 to the next working backend. OSS is last in the Linux preference order
-because on modern distros `/dev/dsp` is supplied by an OSS-emulator
-sitting on top of ALSA — when ALSA itself is present, opening it
-directly bypasses one level of indirection.
+because on modern distros `/dev/dsp` is often supplied by an OSS-emulator
+sitting on top of ALSA. On FreeBSD, OSS is the native system audio ABI and
+is the normal backend rather than a compatibility fallback.
 
 `Driver::is_stub()` reports whether a backend ships as a placeholder
 (PipeWire, ASIO) versus a working implementation whose shared library
@@ -114,10 +127,10 @@ for dev in d.output_devices()? {
 | Windows | WASAPI    | `IMMDeviceEnumerator::EnumAudioEndpoints(eRender, ACTIVE)` + `PKEY_Device_FriendlyName` |
 | macOS   | CoreAudio | HAL `kAudioHardwarePropertyDevices`, kept where output streams exist       |
 
-Backends that can only reach the default device (the PulseAudio
-"simple" API) and the not-yet-wired stubs (PipeWire, OSS, ASIO) return
-an **empty list** rather than an error, so a caller can union device
-lists across every probed driver without per-backend special-casing.
+Backends that currently only expose default-device playback (the
+PulseAudio "simple" API and OSS) and the not-yet-wired stubs (PipeWire,
+ASIO) return an **empty list** rather than an error, so a caller can union
+device lists across every probed driver without per-backend special-casing.
 
 `Driver::default_output_device()` is the one-call shortcut for the
 common "where does the system play right now?" query — it returns the
