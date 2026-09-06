@@ -42,8 +42,14 @@ use crate::{Error, Result};
 /// is octal 1, `O_NONBLOCK` is octal 0o4000. Reading them off the libc
 /// header would also work but the values are kernel-fixed across glibc /
 /// musl / dietlibc on every Linux distro.
+#[cfg(target_os = "linux")]
 const O_WRONLY: c_int = 1;
+#[cfg(target_os = "linux")]
 const O_NONBLOCK: c_int = 0o4000;
+#[cfg(target_os = "freebsd")]
+const O_WRONLY: c_int = 0x0001;
+#[cfg(target_os = "freebsd")]
+const O_NONBLOCK: c_int = 0x0004;
 
 type Fn_open = unsafe extern "C" fn(path: *const c_char, flags: c_int, mode: c_uint) -> c_int;
 type Fn_close = unsafe extern "C" fn(fd: c_int) -> c_int;
@@ -74,7 +80,7 @@ impl OssLib {
         // Same soname candidates as `alsa::load_libc_free` — keep the
         // list in sync. glibc + musl + the BSD-flavoured libc on a few
         // Linux distros all live behind one of these.
-        const CANDIDATES: &[&str] = &["libc.so.6", "libc.so", "libc.musl-x86_64.so.1"];
+        const CANDIDATES: &[&str] = &["libc.so.7", "libc.so.6", "libc.so", "libc.musl-x86_64.so.1"];
         let mut last_err: Option<libloading::Error> = None;
         for &name in CANDIDATES {
             match unsafe { Library::new(name) } {
@@ -145,38 +151,47 @@ fn lib() -> Result<Arc<OssLib>> {
 // `include/uapi/linux/soundcard.h` shipped with every Linux distro.
 // ---------------------------------------------------------------------------
 
+#[cfg(target_os = "linux")]
 const IOC_DIR_WRITE: u32 = 1;
+#[cfg(target_os = "linux")]
 const IOC_DIR_READ: u32 = 2;
+#[cfg(target_os = "linux")]
 const IOC_TYPE_P: u32 = b'P' as u32;
 
-/// Build a Linux `_IOC` request number at const time so the constants
-/// below are computed from first principles (kernel ABI macro) rather
-/// than transcribed magic hex.
+#[cfg(target_os = "linux")]
 const fn ioc(dir: u32, ty: u32, nr: u32, sz: u32) -> c_ulong_ioctl {
     ((dir << 30) | (sz << 16) | (ty << 8) | nr) as c_ulong_ioctl
 }
+#[cfg(target_os = "linux")]
 const fn iowr_int(nr: u32) -> c_ulong_ioctl {
     ioc(IOC_DIR_READ | IOC_DIR_WRITE, IOC_TYPE_P, nr, 4)
 }
 
-/// `SNDCTL_DSP_RESET = _IO('P', 0)` — stops the device, drops any
-/// queued audio.
+#[cfg(target_os = "linux")]
 const SNDCTL_DSP_RESET: c_ulong_ioctl = ioc(0, IOC_TYPE_P, 0, 0);
-/// `SNDCTL_DSP_SYNC = _IO('P', 1)` — block until everything queued has
-/// played, then return. Resolved but unused today; kept around for the
-/// `drain()` surface a future round will add.
+#[cfg(target_os = "linux")]
 #[allow(dead_code)]
 const SNDCTL_DSP_SYNC: c_ulong_ioctl = ioc(0, IOC_TYPE_P, 1, 0);
-/// `SNDCTL_DSP_SPEED = _IOWR('P', 2, int)` — request sample rate;
-/// kernel writes the snapped rate back.
+#[cfg(target_os = "linux")]
 const SNDCTL_DSP_SPEED: c_ulong_ioctl = iowr_int(2);
-/// `SNDCTL_DSP_SETFMT = _IOWR('P', 5, int)` — request sample format
-/// (one of the `AFMT_*` constants below); kernel writes the granted
-/// format back.
+#[cfg(target_os = "linux")]
 const SNDCTL_DSP_SETFMT: c_ulong_ioctl = iowr_int(5);
-/// `SNDCTL_DSP_CHANNELS = _IOWR('P', 6, int)` — request channel count;
-/// kernel writes the snapped count back.
+#[cfg(target_os = "linux")]
 const SNDCTL_DSP_CHANNELS: c_ulong_ioctl = iowr_int(6);
+
+// FreeBSD's OSS API uses the BSD _IOC encoding from <sys/ioccom.h>.
+// Values below are the expansion of the corresponding <sys/soundcard.h> macros.
+#[cfg(target_os = "freebsd")]
+const SNDCTL_DSP_RESET: c_ulong_ioctl = 0x20005000;
+#[cfg(target_os = "freebsd")]
+#[allow(dead_code)]
+const SNDCTL_DSP_SYNC: c_ulong_ioctl = 0x20005001;
+#[cfg(target_os = "freebsd")]
+const SNDCTL_DSP_SPEED: c_ulong_ioctl = 0xc0045002;
+#[cfg(target_os = "freebsd")]
+const SNDCTL_DSP_SETFMT: c_ulong_ioctl = 0xc0045005;
+#[cfg(target_os = "freebsd")]
+const SNDCTL_DSP_CHANNELS: c_ulong_ioctl = 0xc0045006;
 
 /// `AFMT_S16_LE = 0x10` — the one format every OSS driver advertises;
 /// even the kernel's `oss-emulator` on top of ALSA guarantees it.

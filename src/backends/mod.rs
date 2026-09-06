@@ -7,7 +7,7 @@ use crate::backend::Backend;
 
 #[cfg(all(target_os = "linux", feature = "alsa"))]
 pub(crate) mod alsa;
-#[cfg(all(target_os = "linux", feature = "oss"))]
+#[cfg(all(any(target_os = "linux", target_os = "freebsd"), feature = "oss"))]
 pub(crate) mod oss;
 #[cfg(all(target_os = "linux", feature = "pipewire"))]
 pub(crate) mod pipewire;
@@ -43,6 +43,15 @@ pub(crate) fn drivers() -> &'static [&'static dyn Backend] {
             &mock::MockBackend,
         ]
     }
+    #[cfg(target_os = "freebsd")]
+    {
+        &[
+            #[cfg(feature = "oss")]
+            &oss::OssBackend,
+            #[cfg(feature = "mock")]
+            &mock::MockBackend,
+        ]
+    }
     #[cfg(target_os = "windows")]
     {
         &[
@@ -63,7 +72,12 @@ pub(crate) fn drivers() -> &'static [&'static dyn Backend] {
             &mock::MockBackend,
         ]
     }
-    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "windows",
+        target_os = "macos"
+    )))]
     {
         &[
             #[cfg(feature = "mock")]
