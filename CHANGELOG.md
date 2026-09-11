@@ -189,9 +189,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `write(2)`. `Stream::pause` skips the user callback and writes silence
   (OSS has no soft-cork); `Stream::stop` issues `SNDCTL_DSP_RESET` to
   drop the tail buffer rather than blocking on drain. `Stream::latency`
-  reports the worker-side period buffering
-  (`period_frames / sample_rate`); hardware-side delay via
-  `SNDCTL_DSP_GETODELAY` is a follow-up. Per-device routing falls out
+  queries `SNDCTL_DSP_GETODELAY` for the live queued output-byte count
+  and converts it to time using the negotiated S16_LE frame size and sample
+  rate; OSS implementations that reject the ioctl fall back to one worker
+  period. Per-device routing falls out
   of OSS's naming convention: `StreamRequest::with_device("/dev/dsp1")`
   binds the stream to an alternate character device. The ioctl request
   numbers are computed at const time via a local `_IOC(dir, type, nr,

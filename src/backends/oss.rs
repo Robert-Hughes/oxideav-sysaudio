@@ -18,7 +18,7 @@
 #![allow(non_snake_case)]
 
 use std::ffi::{c_char, c_int, c_uint, c_void, CString};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -146,8 +146,7 @@ fn lib() -> Result<Arc<OssLib>> {
 //   _IOR (t,n,s) = _IOC(2, t, n, sizeof(s))
 //   _IO  (t,n)   = _IOC(0, t, n, 0)
 //
-// Every `SNDCTL_DSP_*` ioctl below is `_IOWR('P', N, int)` (size 4)
-// except where noted. Values verified against the kernel UAPI header
+// Values verified against the kernel UAPI header
 // `include/uapi/linux/soundcard.h` shipped with every Linux distro.
 // ---------------------------------------------------------------------------
 
@@ -166,6 +165,10 @@ const fn ioc(dir: u32, ty: u32, nr: u32, sz: u32) -> c_ulong_ioctl {
 const fn iowr_int(nr: u32) -> c_ulong_ioctl {
     ioc(IOC_DIR_READ | IOC_DIR_WRITE, IOC_TYPE_P, nr, 4)
 }
+#[cfg(target_os = "linux")]
+const fn ior_int(nr: u32) -> c_ulong_ioctl {
+    ioc(IOC_DIR_READ, IOC_TYPE_P, nr, 4)
+}
 
 #[cfg(target_os = "linux")]
 const SNDCTL_DSP_RESET: c_ulong_ioctl = ioc(0, IOC_TYPE_P, 0, 0);
@@ -178,6 +181,8 @@ const SNDCTL_DSP_SPEED: c_ulong_ioctl = iowr_int(2);
 const SNDCTL_DSP_SETFMT: c_ulong_ioctl = iowr_int(5);
 #[cfg(target_os = "linux")]
 const SNDCTL_DSP_CHANNELS: c_ulong_ioctl = iowr_int(6);
+#[cfg(target_os = "linux")]
+const SNDCTL_DSP_GETODELAY: c_ulong_ioctl = ior_int(23);
 
 // FreeBSD's OSS API uses the BSD _IOC encoding from <sys/ioccom.h>.
 // Values below are the expansion of the corresponding <sys/soundcard.h> macros.
@@ -192,6 +197,8 @@ const SNDCTL_DSP_SPEED: c_ulong_ioctl = 0xc0045002;
 const SNDCTL_DSP_SETFMT: c_ulong_ioctl = 0xc0045005;
 #[cfg(target_os = "freebsd")]
 const SNDCTL_DSP_CHANNELS: c_ulong_ioctl = 0xc0045006;
+#[cfg(target_os = "freebsd")]
+const SNDCTL_DSP_GETODELAY: c_ulong_ioctl = 0x40045017;
 
 /// `AFMT_S16_LE = 0x10` — the one format every OSS driver advertises;
 /// even the kernel's `oss-emulator` on top of ALSA guarantees it.
@@ -326,11 +333,6 @@ fn configure_and_spawn(
     let stop = Arc::new(AtomicBool::new(false));
     let paused = Arc::new(AtomicBool::new(false));
     let frames_played = Arc::new(AtomicU64::new(0));
-    // OSS has no `SNDCTL_DSP_GETODELAY`-equivalent we can rely on across
-    // every kernel; we publish the queued-byte estimate (period_frames
-    // × channels × 2 bytes/frame) instead so `Stream::latency()` reports
-    // at least the worker's own buffering.
-    let queued_frames = Arc::new(AtomicI32::new(0));
 
     let state = OssWorkerState {
         lib: l.clone(),
@@ -341,7 +343,6 @@ fn configure_and_spawn(
         stop: stop.clone(),
         paused: paused.clone(),
         frames_played: frames_played.clone(),
-        queued_frames: queued_frames.clone(),
     };
 
     let thread = std::thread::Builder::new()
@@ -358,7 +359,7 @@ fn configure_and_spawn(
         paused,
         stop,
         thread: Some(thread),
-        queued_frames,
+        fallback_period_frames: period_frames as u64,
         format: StreamFormat {
             sample_rate,
             channels: channels as u16,
@@ -376,7 +377,6 @@ struct OssWorkerState {
     stop: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     frames_played: Arc<AtomicU64>,
-    queued_frames: Arc<AtomicI32>,
 }
 
 impl OssWorkerState {
@@ -420,10 +420,6 @@ impl OssWorkerState {
                 self.frames_played
                     .fetch_add(frames_written as u64, Ordering::Relaxed);
             }
-            // Worker-side buffering estimate — at least one period sits
-            // in our own write buffer when the loop is up to speed.
-            self.queued_frames
-                .store(self.period_frames as i32, Ordering::Relaxed);
         }
     }
 }
@@ -436,6 +432,17 @@ fn convert_f32_to_s16(src: &[f32], dst: &mut [i16]) {
         let v = (s.clamp(-1.0, 1.0) * 32767.0) as i32;
         *d = v.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
     }
+}
+
+fn frames_to_duration(frames: u64, sample_rate: u32) -> Duration {
+    let rate = u64::from(sample_rate.max(1));
+    let nanos = frames.saturating_mul(1_000_000_000) / rate;
+    Duration::from_nanos(nanos)
+}
+
+fn queued_bytes_to_duration(queued_bytes: u64, channels: u16, sample_rate: u32) -> Duration {
+    let bytes_per_frame = u64::from(channels.max(1)).saturating_mul(2);
+    frames_to_duration(queued_bytes / bytes_per_frame, sample_rate)
 }
 
 /// RAII fd holder so a panic or early `Drop::drop` on the stream still
@@ -453,7 +460,7 @@ struct OssStream {
     paused: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
-    queued_frames: Arc<AtomicI32>,
+    fallback_period_frames: u64,
     format: StreamFormat,
 }
 
@@ -472,10 +479,26 @@ impl StreamImpl for OssStream {
         self.format
     }
     fn latency(&self) -> Option<Duration> {
-        let frames = self.queued_frames.load(Ordering::Relaxed).max(0) as u64;
-        let rate = self.format.sample_rate.max(1) as u64;
-        let nanos = frames.saturating_mul(1_000_000_000) / rate;
-        Some(Duration::from_nanos(nanos))
+        let mut queued_bytes: c_int = 0;
+        let measured = unsafe {
+            (self.lib.ioctl)(
+                self.fd.fd(),
+                SNDCTL_DSP_GETODELAY,
+                &mut queued_bytes as *mut c_int as *mut c_void,
+            )
+        };
+        if measured >= 0 && queued_bytes >= 0 {
+            return Some(queued_bytes_to_duration(
+                queued_bytes as u64,
+                self.format.channels,
+                self.format.sample_rate,
+            ));
+        }
+
+        Some(frames_to_duration(
+            self.fallback_period_frames,
+            self.format.sample_rate,
+        ))
     }
     fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -502,20 +525,25 @@ impl StreamImpl for OssStream {
 mod tests {
     use super::*;
 
-    /// Verify the `_IOC` packing against well-known OSS ABI numbers
-    /// derived from the same kernel UAPI macro. `_IOWR('P', 2, int)`
-    /// (`SNDCTL_DSP_SPEED`) packs as:
-    ///   (3 << 30) | (4 << 16) | ('P' << 8) | 2
-    /// = 0xC0040000 | 0x5000 | 0x02 = 0xC0045002
     #[test]
-    fn ioctl_request_numbers_match_uapi_macro() {
+    fn ioctl_request_numbers_match_platform_uapi() {
         assert_eq!(SNDCTL_DSP_SPEED, 0xC0045002);
         assert_eq!(SNDCTL_DSP_SETFMT, 0xC0045005);
         assert_eq!(SNDCTL_DSP_CHANNELS, 0xC0045006);
-        // `_IO('P', 0)` = (0 << 30) | (0 << 16) | ('P' << 8) | 0 = 0x5000
-        assert_eq!(SNDCTL_DSP_RESET, 0x5000);
-        // `_IO('P', 1)` = 0x5001
-        assert_eq!(SNDCTL_DSP_SYNC, 0x5001);
+
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(SNDCTL_DSP_RESET, 0x5000);
+            assert_eq!(SNDCTL_DSP_SYNC, 0x5001);
+            assert_eq!(SNDCTL_DSP_GETODELAY, 0x80045017);
+        }
+
+        #[cfg(target_os = "freebsd")]
+        {
+            assert_eq!(SNDCTL_DSP_RESET, 0x20005000);
+            assert_eq!(SNDCTL_DSP_SYNC, 0x20005001);
+            assert_eq!(SNDCTL_DSP_GETODELAY, 0x40045017);
+        }
     }
 
     #[test]
@@ -554,10 +582,27 @@ mod tests {
     }
 
     #[test]
-    fn o_flags_match_linux_uapi() {
-        // Kernel UAPI guarantees octal 0o1 / 0o4000 for these on every
-        // Linux architecture we care about.
+    fn queued_bytes_convert_to_output_latency() {
+        assert_eq!(
+            queued_bytes_to_duration(3_528, 2, 44_100),
+            Duration::from_millis(20)
+        );
+        assert_eq!(
+            queued_bytes_to_duration(3_840, 2, 48_000),
+            Duration::from_millis(20)
+        );
+        assert_eq!(queued_bytes_to_duration(0, 2, 48_000), Duration::ZERO);
+        assert_eq!(frames_to_duration(882, 44_100), Duration::from_millis(20));
+    }
+
+    #[test]
+    fn o_flags_match_platform_uapi() {
         assert_eq!(O_WRONLY, 1);
+
+        #[cfg(target_os = "linux")]
         assert_eq!(O_NONBLOCK, 0o4000);
+
+        #[cfg(target_os = "freebsd")]
+        assert_eq!(O_NONBLOCK, 0x0004);
     }
 }
