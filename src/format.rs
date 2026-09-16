@@ -46,6 +46,9 @@ pub struct StreamRequest {
     ///   before the queue starts. `latency()` follows the bound device.
     ///   Fabricated / cross-backend strings that don't parse as a decimal
     ///   id surface as [`crate::Error::UnsupportedFormat`].
+    /// - **AAudio**: the decimal Android `AudioDeviceInfo.getId()` value.
+    ///   AAudio's native API can route to that id but does not enumerate devices,
+    ///   so callers obtain it from Android's Java API when explicit routing is needed.
     ///
     /// Passing an id that the backend can't resolve surfaces as a normal
     /// [`crate::Error::DeviceOpen`].

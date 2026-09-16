@@ -20,6 +20,21 @@ implementation does not reuse Linux ioctl numbers or request packing.
 Like the other backends, the libc entry points are resolved at runtime, so
 adding FreeBSD OSS support does not add a link-time audio dependency.
 
+## Android AAudio
+
+Android API 26+ uses the native AAudio callback API through runtime-loaded
+`libaaudio.so`. Streams request interleaved PCM f32, output direction and the
+low-latency performance mode; Android remains free to route through its normal
+shared mixer. An optional numeric device id maps directly to
+`AudioDeviceInfo.getId()`. AAudio itself does not enumerate devices, so explicit
+routing ids must come from the Android framework when needed.
+
+`examples/smoke.rs` is a small cross-platform acceptance executable. It is silent
+by default and exercises probe/open, format negotiation, callback progress,
+software volume, pause/resume, latency and teardown. Pass `--tone` only when an
+audible 440 Hz check is desired. The same example can be cross-compiled as a
+standalone Android ELF and run directly under `adb shell`; no APK is required.
+
 ## Backends
 
 | Target  | Backend   | Status      | Shared object                                                                 |
@@ -32,6 +47,7 @@ adding FreeBSD OSS support does not add a link-time audio dependency.
 | Windows | WASAPI    | Functional  | `ole32.dll` + `kernel32.dll` (COM vtables invoked by hand, shared-mode)       |
 | Windows | ASIO      | Stub        | Vendor-supplied DLLs under `HKLM\SOFTWARE\ASIO` (not yet wired)               |
 | macOS   | CoreAudio | Functional  | `AudioToolbox.framework` (AudioQueue API)                                     |
+| Android | AAudio    | **Functional** | `libaaudio.so` (API 26+, runtime-loaded native data callback)                 |
 | any     | Mock      | Test-only   | none — virtual discard/capture sink (non-default cargo feature `mock`)       |
 
 `probe()` returns the subset of these whose shared object loads AND
@@ -41,6 +57,7 @@ whose dummy-open succeeds, in the documented preference order:
 - FreeBSD: OSS
 - Windows: WASAPI → ASIO
 - macOS: CoreAudio
+- Android: AAudio
 
 Stubbed backends fail `probe()` cleanly so auto-selection falls through
 to the next working backend. OSS is last in the Linux preference order
@@ -126,11 +143,13 @@ for dev in d.output_devices()? {
 | Linux   | ALSA      | `snd_device_name_hint("pcm")`, filtered to `IOID=Output`/duplex            |
 | Windows | WASAPI    | `IMMDeviceEnumerator::EnumAudioEndpoints(eRender, ACTIVE)` + `PKEY_Device_FriendlyName` |
 | macOS   | CoreAudio | HAL `kAudioHardwarePropertyDevices`, kept where output streams exist       |
+| Android | AAudio    | No native enumeration API; ids come from Java `AudioManager.getDevices()` |
 
-Backends that currently only expose default-device playback (the
-PulseAudio "simple" API and OSS) and the not-yet-wired stubs (PipeWire,
-ASIO) return an **empty list** rather than an error, so a caller can union
-device lists across every probed driver without per-backend special-casing.
+Backends without native enumeration (PulseAudio simple, OSS and AAudio) and
+the not-yet-wired stubs (PipeWire, ASIO) return an **empty list** rather than
+an error, so a caller can union device lists across every probed driver without
+per-backend special-casing. AAudio can still route to an out-of-band numeric
+`AudioDeviceInfo` id supplied through `StreamRequest::with_device`.
 
 `Driver::default_output_device()` is the one-call shortcut for the
 common "where does the system play right now?" query — it returns the
@@ -172,6 +191,7 @@ network PulseAudio, HDMI passthrough, etc.):
 | OSS       | `SNDCTL_DSP_GETODELAY` queued output bytes, with one-period fallback if unsupported | No               |
 | WASAPI    | Live `IAudioClock::GetPosition` vs. frames-written delta (end-to-end, includes the device hardware pipeline). Falls back to `GetStreamLatency` + live `GetCurrentPadding` if the driver shim doesn't implement `IAudioClock`. | Yes              |
 | CoreAudio | `num_buffers × period` + HAL (`kAudioDevicePropertyLatency` + buffer frame size + safety offset + stream latency) | Yes              |
+| AAudio    | Live `AAudioStream_getFramesWritten() - AAudioStream_getFramesRead()` queue depth, with opened capacity fallback | Partial          |
 
 ## Features
 
@@ -209,6 +229,7 @@ for dev in d.output_devices()? {
 | PulseAudio| `id` is a sink name; passed as the `dev` arg of `pa_simple_new`.                |
 | WASAPI    | `id` is the LPWSTR endpoint id; resolved via `IMMDeviceEnumerator::GetDevice`.  |
 | CoreAudio | `id` is the decimal `AudioDeviceID`; HAL `kAudioDevicePropertyDeviceUID` yields the CFString, then `AudioQueueSetProperty(kAudioQueueProperty_CurrentDevice, &cfstr)` binds the queue. `latency()` follows the bound device. |
+| AAudio    | `id` is the decimal Android `AudioDeviceInfo.getId()` value; passed to `AAudioStreamBuilder_setDeviceId`, then read back with `AAudioStream_getDeviceId`. If Android silently routes elsewhere, open fails instead of claiming success. The native API does not enumerate ids itself. |
 
 Leaving `device` as `None` (the default constructor) opens the system
 default endpoint, matching the historical `open()` / `open_default()`
@@ -231,6 +252,7 @@ board).
 | PulseAudio| Filled into a `pa_buffer_attr` (`tlength = frames × bytes_per_frame`, `minreq` ≈ one period and capped at `tlength`); other fields stay `(uint32_t)-1`. Worker write size follows the hint so client and server stay aligned. |
 | WASAPI    | Translated to `REFERENCE_TIME` (100 ns ticks) via `frames × 10_000_000 / sample_rate` with i128 widening; passed as `hnsBufferDuration` to `IAudioClient::Initialize`. WASAPI clamps below the device's minimum period. |
 | CoreAudio | `kAudioQueueProperty_NumberOfBuffers` × buffer size derived from the hint.                                              |
+| AAudio    | `AAudioStreamBuilder_setFramesPerDataCallback`; capacity is requested at `2 ×` the callback size. `None` leaves AAudio free to choose its optimal callback quantum. |
 
 Sub-millisecond hints round up to at least one tick on WASAPI; massive
 hints saturate rather than overflow.
@@ -254,6 +276,7 @@ if let Some(fmt) = d.preferred_format(None)? {
 | --------- | -------------------------------------------------------------------------------------------------------------------------- |
 | WASAPI    | `IAudioClient::GetMixFormat` (the shared-mode mix engine's preferred format — typically 48 kHz f32 stereo on Windows-10/11). |
 | CoreAudio | HAL `kAudioDevicePropertyNominalSampleRate` for the rate + `kAudioStreamPropertyVirtualFormat` on the device's first output stream for the channel count. Aggregate devices stay coherent (per-stream rates may disagree). |
+| AAudio    | Throwaway PCM-float output stream with unspecified rate/channels, then `AAudioStream_getSampleRate` / `getChannelCount`; the stream is closed without being started. |
 | ALSA      | Throwaway `snd_pcm_open` in `NONBLOCK` mode + `snd_pcm_hw_params_any` to load the device's full param space, then `snd_pcm_hw_params_set_rate_near(48000)` and `snd_pcm_hw_params_set_channels_near(2)` to read the snapped values out of their mutable args — the same path the real `open()` walks. The PCM is closed before the call returns. |
 | Others    | `Ok(None)` — PulseAudio simple API exposes no sink introspection; OSS's `SNDCTL_DSP_*` family is in-band (committing the values to the device) so there's no read-without-write path; PipeWire/ASIO are stubs. |
 

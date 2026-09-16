@@ -465,7 +465,13 @@ mod tests {
     fn drivers_non_empty_per_platform() {
         // Every platform we support should have at least one compiled-in
         // backend — even if all are stubs, the list shouldn't be empty.
-        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "android"
+        ))]
         assert!(!drivers().is_empty());
     }
 
