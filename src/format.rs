@@ -11,6 +11,41 @@ pub enum SampleFormat {
     F32,
 }
 
+/// Semantic purpose of an output stream.
+///
+/// Backends that expose a native usage/category concept should map this value
+/// to the closest platform equivalent. Backends without such a concept ignore
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamUsage {
+    Media,
+}
+
+impl Default for StreamUsage {
+    fn default() -> Self {
+        Self::Media
+    }
+}
+
+/// Semantic type of audio carried by an output stream.
+///
+/// This is deliberately separate from [`StreamUsage`]: a media stream can be
+/// music, a movie soundtrack, speech, and so on. Platform backends may use this
+/// hint to select policy or DSP appropriate to the content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentType {
+    Music,
+    Movie,
+    Speech,
+    Sonification,
+}
+
+impl Default for ContentType {
+    fn default() -> Self {
+        Self::Music
+    }
+}
+
 /// Caller-supplied preferred format. Backends may return a different
 /// actual format in [`StreamFormat`] if the device can't honor the
 /// request exactly.
@@ -19,6 +54,10 @@ pub struct StreamRequest {
     pub sample_rate: u32,
     pub channels: u16,
     pub format: SampleFormat,
+    /// Semantic purpose of the stream. Defaults to media playback.
+    pub usage: StreamUsage,
+    /// Semantic type of the stream content. Defaults to music.
+    pub content_type: ContentType,
     /// Requested buffer size in frames (one frame = `channels` samples).
     /// `None` lets the backend pick. Backends treat this as a hint, not
     /// a constraint.
@@ -61,9 +100,23 @@ impl StreamRequest {
             sample_rate,
             channels,
             format: SampleFormat::F32,
+            usage: StreamUsage::default(),
+            content_type: ContentType::default(),
             buffer_frames: None,
             device: None,
         }
+    }
+
+    /// Set the semantic purpose of this stream.
+    pub fn with_usage(mut self, usage: StreamUsage) -> Self {
+        self.usage = usage;
+        self
+    }
+
+    /// Set the semantic type of audio carried by this stream.
+    pub fn with_content_type(mut self, content_type: ContentType) -> Self {
+        self.content_type = content_type;
+        self
     }
 
     /// Bind this request to a specific enumerated device, identified by

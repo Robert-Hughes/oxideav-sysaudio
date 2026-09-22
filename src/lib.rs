@@ -41,7 +41,9 @@ mod format;
 mod stream;
 
 pub use error::{Error, Result};
-pub use format::{CallbackInfo, Device, SampleFormat, StreamFormat, StreamRequest};
+pub use format::{
+    CallbackInfo, ContentType, Device, SampleFormat, StreamFormat, StreamRequest, StreamUsage,
+};
 pub use stream::Stream;
 
 /// Test-support helpers for the virtual `"mock"` backend (cargo
@@ -526,6 +528,19 @@ mod tests {
         assert_eq!(r.buffer_frames, Some(256));
         let r2 = r.with_buffer_frames(None);
         assert_eq!(r2.buffer_frames, None);
+    }
+
+    #[test]
+    fn stream_request_usage_and_content_type_builders() {
+        let defaults = StreamRequest::new(48_000, 2);
+        assert_eq!(defaults.usage, StreamUsage::Media);
+        assert_eq!(defaults.content_type, ContentType::Music);
+
+        let movie = defaults
+            .with_usage(StreamUsage::Media)
+            .with_content_type(ContentType::Movie);
+        assert_eq!(movie.usage, StreamUsage::Media);
+        assert_eq!(movie.content_type, ContentType::Movie);
     }
 
     #[test]

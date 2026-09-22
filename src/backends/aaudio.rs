@@ -23,7 +23,9 @@ use std::time::Duration;
 use libloading::{Library, Symbol};
 
 use crate::backend::{Backend, Callback};
-use crate::format::{CallbackInfo, SampleFormat, StreamFormat, StreamRequest};
+use crate::format::{
+    CallbackInfo, ContentType, SampleFormat, StreamFormat, StreamRequest, StreamUsage,
+};
 use crate::stream::StreamImpl;
 use crate::{Error, Result};
 
@@ -31,6 +33,11 @@ const AAUDIO_OK: i32 = 0;
 const AAUDIO_DIRECTION_OUTPUT: i32 = 0;
 const AAUDIO_FORMAT_PCM_FLOAT: i32 = 2;
 const AAUDIO_PERFORMANCE_MODE_LOW_LATENCY: i32 = 12;
+const AAUDIO_USAGE_MEDIA: i32 = 1;
+const AAUDIO_CONTENT_TYPE_SPEECH: i32 = 1;
+const AAUDIO_CONTENT_TYPE_MUSIC: i32 = 2;
+const AAUDIO_CONTENT_TYPE_MOVIE: i32 = 3;
+const AAUDIO_CONTENT_TYPE_SONIFICATION: i32 = 4;
 const AAUDIO_CALLBACK_RESULT_CONTINUE: i32 = 0;
 const AAUDIO_CALLBACK_RESULT_STOP: i32 = 1;
 
@@ -61,6 +68,8 @@ type Fn_AAudioStreamBuilder_setFramesPerDataCallback =
     unsafe extern "C" fn(*mut AAudioStreamBuilder, i32);
 type Fn_AAudioStreamBuilder_setPerformanceMode =
     unsafe extern "C" fn(*mut AAudioStreamBuilder, i32);
+type Fn_AAudioStreamBuilder_setUsage = unsafe extern "C" fn(*mut AAudioStreamBuilder, i32);
+type Fn_AAudioStreamBuilder_setContentType = unsafe extern "C" fn(*mut AAudioStreamBuilder, i32);
 type Fn_AAudioStreamBuilder_setDataCallback =
     unsafe extern "C" fn(*mut AAudioStreamBuilder, Option<AAudioStream_dataCallback>, *mut c_void);
 type Fn_AAudioStreamBuilder_setErrorCallback =
@@ -93,6 +102,8 @@ struct AAudioLib {
     AAudioStreamBuilder_setBufferCapacityInFrames: Fn_AAudioStreamBuilder_setBufferCapacityInFrames,
     AAudioStreamBuilder_setFramesPerDataCallback: Fn_AAudioStreamBuilder_setFramesPerDataCallback,
     AAudioStreamBuilder_setPerformanceMode: Fn_AAudioStreamBuilder_setPerformanceMode,
+    AAudioStreamBuilder_setUsage: Option<Fn_AAudioStreamBuilder_setUsage>,
+    AAudioStreamBuilder_setContentType: Option<Fn_AAudioStreamBuilder_setContentType>,
     AAudioStreamBuilder_setDataCallback: Fn_AAudioStreamBuilder_setDataCallback,
     AAudioStreamBuilder_setErrorCallback: Fn_AAudioStreamBuilder_setErrorCallback,
     AAudioStreamBuilder_openStream: Fn_AAudioStreamBuilder_openStream,
@@ -122,6 +133,14 @@ impl AAudioLib {
         })?;
 
         unsafe {
+            macro_rules! opt_sym {
+                ($name:ident, $ty:ty) => {{
+                    lib.get::<$ty>(concat!(stringify!($name), "\0").as_bytes())
+                        .ok()
+                        .map(|symbol| *symbol)
+                }};
+            }
+
             macro_rules! sym {
                 ($name:ident, $ty:ty) => {{
                     let symbol: Symbol<$ty> = lib
@@ -175,6 +194,14 @@ impl AAudioLib {
                 AAudioStreamBuilder_setPerformanceMode: sym!(
                     AAudioStreamBuilder_setPerformanceMode,
                     Fn_AAudioStreamBuilder_setPerformanceMode
+                ),
+                AAudioStreamBuilder_setUsage: opt_sym!(
+                    AAudioStreamBuilder_setUsage,
+                    Fn_AAudioStreamBuilder_setUsage
+                ),
+                AAudioStreamBuilder_setContentType: opt_sym!(
+                    AAudioStreamBuilder_setContentType,
+                    Fn_AAudioStreamBuilder_setContentType
                 ),
                 AAudioStreamBuilder_setDataCallback: sym!(
                     AAudioStreamBuilder_setDataCallback,
@@ -319,6 +346,20 @@ impl Drop for RawStream {
     }
 }
 
+fn aaudio_usage(usage: StreamUsage) -> i32 {
+    match usage {
+        StreamUsage::Media => AAUDIO_USAGE_MEDIA,
+    }
+}
+
+fn aaudio_content_type(content_type: ContentType) -> i32 {
+    match content_type {
+        ContentType::Music => AAUDIO_CONTENT_TYPE_MUSIC,
+        ContentType::Movie => AAUDIO_CONTENT_TYPE_MOVIE,
+        ContentType::Speech => AAUDIO_CONTENT_TYPE_SPEECH,
+        ContentType::Sonification => AAUDIO_CONTENT_TYPE_SONIFICATION,
+    }
+}
 fn parse_device_id(device: Option<&str>) -> Result<Option<i32>> {
     device
         .map(|value| {
@@ -543,6 +584,12 @@ impl Backend for AAudioBackend {
                 builder.ptr,
                 AAUDIO_PERFORMANCE_MODE_LOW_LATENCY,
             );
+            if let Some(set_usage) = lib.AAudioStreamBuilder_setUsage {
+                set_usage(builder.ptr, aaudio_usage(req.usage));
+            }
+            if let Some(set_content_type) = lib.AAudioStreamBuilder_setContentType {
+                set_content_type(builder.ptr, aaudio_content_type(req.content_type));
+            }
 
             if let Some(id) = requested_device {
                 (lib.AAudioStreamBuilder_setDeviceId)(builder.ptr, id);
